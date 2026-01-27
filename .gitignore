@@ -1,6 +1,8 @@
 *.class
 *.iml
 .idea/
+.metals/
+.bloop/
 .DS_Store
 .java-version
 target/**
