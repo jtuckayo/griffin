@@ -1,0 +1,281 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Apache Griffin Batch Mode on ECS (EC2 launch type). Deploys griffin_spark2 + elasticsearch containers on a single t3.xlarge instance.
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC to deploy into
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Public subnet for the EC2 instance
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 key pair for SSH access
+
+  YourIpCidr:
+    Type: String
+    Default: 43.245.57.74/32
+    Description: |
+      CIDR allowed to access Griffin ports (e.g. 1.2.3.4/32). Defaults to open — restrict this for security.
+
+  InstanceType:
+    Type: String
+    Default: t3.xlarge
+    AllowedValues:
+      - t3.large
+      - t3.xlarge
+      - m6i.xlarge
+    Description: EC2 instance type. t3.xlarge (16 GB) recommended for batch mode.
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # ── IAM ──────────────────────────────────────────────────────────────────
+
+  EcsInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub griffin-ecs-instance-role-${AWS::StackName}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: project
+          Value: apache-griffin
+
+  EcsInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EcsInstanceRole
+
+  # ── Networking ────────────────────────────────────────────────────────────
+
+  GriffinSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Apache Griffin ECS Security Group
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - Description: SSH
+          IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref YourIpCidr
+        - Description: Griffin UI
+          IpProtocol: tcp
+          FromPort: 38080
+          ToPort: 38080
+          CidrIp: !Ref YourIpCidr
+        - Description: YARN Resource Manager UI
+          IpProtocol: tcp
+          FromPort: 38088
+          ToPort: 38088
+          CidrIp: !Ref YourIpCidr
+        - Description: Elasticsearch REST
+          IpProtocol: tcp
+          FromPort: 39200
+          ToPort: 39200
+          CidrIp: !Ref YourIpCidr
+      Tags:
+        - Key: Name
+          Value: griffin-sg
+        - Key: project
+          Value: apache-griffin
+
+  # ── Logging ───────────────────────────────────────────────────────────────
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: /ecs/griffin-batch
+      RetentionInDays: 7
+      Tags:
+        - Key: project
+          Value: apache-griffin
+
+  # ── ECS Cluster ───────────────────────────────────────────────────────────
+
+  GriffinCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub griffin-cluster-${AWS::StackName}
+      Tags:
+        - Key: project
+          Value: apache-griffin
+
+  # ── EC2 Instance ──────────────────────────────────────────────────────────
+  # Uses the ECS-optimized Amazon Linux 2 AMI resolved via SSM.
+  # UserData:
+  #   1. Registers the instance with the ECS cluster
+  #   2. Sets vm.max_map_count=262144 (required by Elasticsearch)
+  #   3. Signals CloudFormation once the ECS agent is ready
+  #      so the ECS Service is only created after the instance is registered.
+
+  GriffinInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: '{{resolve:ssm:/aws/service/ecs/optimized-ami/amazon-linux-2/recommended/image_id}}'
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPairName
+      SecurityGroupIds:
+        - !Ref GriffinSecurityGroup
+      SubnetId: !Ref SubnetId
+      IamInstanceProfile: !Ref EcsInstanceProfile
+      Tags:
+        - Key: Name
+          Value: griffin-ecs-node
+        - Key: project
+          Value: apache-griffin
+      UserData: !Base64
+        Fn::Sub: |
+          #!/bin/bash
+          # Write ECS cluster config before ecs.service starts
+          echo ECS_CLUSTER=${GriffinCluster} >> /etc/ecs/ecs.config
+          # Set vm.max_map_count required by Elasticsearch
+          sysctl -w vm.max_map_count=262144
+          echo "vm.max_map_count=262144" >> /etc/sysctl.conf
+
+  # ── ECS Task Definition ───────────────────────────────────────────────────
+  # Mirrors docker-compose-batch.yml:
+  #   - es container linked to griffin via Docker bridge links
+  #   - ES_HOSTNAME=es tells Griffin where to find Elasticsearch
+  #   - mysql-data volume persists MySQL data across task restarts
+
+  GriffinTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: griffin-batch
+      NetworkMode: bridge
+      Tags:
+        - Key: project
+          Value: apache-griffin
+      Volumes:
+        - Name: mysql-data
+      ContainerDefinitions:
+
+        - Name: es
+          Image: apachegriffin/elasticsearch
+          Hostname: es
+          Memory: 4096
+          Cpu: 1024
+          Essential: true
+          PortMappings:
+            - ContainerPort: 9200
+              HostPort: 39200
+              Protocol: tcp
+            - ContainerPort: 9300
+              HostPort: 39300
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /ecs/griffin-batch
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: es
+
+        - Name: griffin
+          Image: apachegriffin/griffin_spark2:0.3.0
+          Hostname: griffin
+          Memory: 10240
+          Cpu: 2048
+          Essential: true
+          Links:
+            - es
+          Environment:
+            - Name: ES_HOSTNAME
+              Value: es
+          MountPoints:
+            - SourceVolume: mysql-data
+              ContainerPath: /var/lib/mysql
+          PortMappings:
+            - ContainerPort: 8080
+              HostPort: 38080
+              Protocol: tcp
+            - ContainerPort: 8088
+              HostPort: 38088
+              Protocol: tcp
+            - ContainerPort: 8042
+              HostPort: 38042
+              Protocol: tcp
+            - ContainerPort: 8998
+              HostPort: 38998
+              Protocol: tcp
+            - ContainerPort: 9083
+              HostPort: 39083
+              Protocol: tcp
+            - ContainerPort: 3306
+              HostPort: 33306
+              Protocol: tcp
+            - ContainerPort: 5432
+              HostPort: 35432
+              Protocol: tcp
+            - ContainerPort: 2122
+              HostPort: 32122
+              Protocol: tcp
+          PseudoTerminal: true
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /ecs/griffin-batch
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: griffin
+
+  # ── ECS Service ───────────────────────────────────────────────────────────
+  # ECS will retry task placement until the EC2 instance registers (~1-2 min).
+
+  GriffinService:
+    Type: AWS::ECS::Service
+    DependsOn: GriffinInstance
+    Properties:
+      ServiceName: griffin-batch-service
+      Cluster: !Ref GriffinCluster
+      TaskDefinition: !Ref GriffinTaskDefinition
+      DesiredCount: 1
+      LaunchType: EC2
+      Tags:
+        - Key: project
+          Value: apache-griffin
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+
+  InstancePublicIp:
+    Description: Public IP of the EC2 instance
+    Value: !GetAtt GriffinInstance.PublicIp
+
+  GriffinUI:
+    Description: Apache Griffin UI — wait ~1 min after stack creation
+    Value: !Sub http://${GriffinInstance.PublicIp}:38080
+
+  YarnUI:
+    Description: YARN Resource Manager UI
+    Value: !Sub http://${GriffinInstance.PublicIp}:38088
+
+  ElasticsearchEndpoint:
+    Description: Elasticsearch REST endpoint
+    Value: !Sub http://${GriffinInstance.PublicIp}:39200
+
+  SshCommand:
+    Description: SSH into the instance
+    Value: !Sub ssh -i ${KeyPairName}.pem ec2-user@${GriffinInstance.PublicIp}
